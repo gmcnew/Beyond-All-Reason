@@ -53,8 +53,8 @@ function gadget:GetInfo()
 	}
 end
 
-local DEBUG = false -- will draw the buildSpeeds above builders. Perf heavy but its debugging only.
-local VERBOSE = false -- will spam debug into infolog
+local DEBUG = true -- will draw the buildSpeeds above builders. Perf heavy but its debugging only.
+local VERBOSE = true -- will spam debug into infolog
 local FORWARDUNIFORMS = false -- Needed for future nanospray GL4
 -- Available Info to Widgets:
 --Number is build speed number, and means low priority, otherwise nil means high
@@ -445,6 +445,11 @@ local function sortMetalBurdensAndGetInitialPointers(lowPrioBuilderMetalBurdens,
 			b1 = bt -- move b1 to the left
 		end
 	end
+	if DEBUG and n > 0 then
+		for i, v in ipairs(lowPrioBuilderMetalBurdens) do
+			Spring.Echo("lowPrioBuilderMetalBurdens[" .. tostring(i) .. "] = " .. v[1] .. ", " .. v[2])
+		end
+	end
 
 	return b0, b1, n
 end
@@ -482,7 +487,6 @@ local function UpdatePassiveBuilders(teamID, interval, gameFrame)
 	if tracy then tracy.ZoneBeginN("UpdateStart") end 
 	local numPassiveCons = 0
 
-	
 	local passiveExpense = {} -- once again, similar to the costIDOverride we are using a single table with offsets to store two values per unitID
 	local totalBuildPower = 0
 	local highPrioBuildPower = 0
@@ -560,6 +564,9 @@ local function UpdatePassiveBuilders(teamID, interval, gameFrame)
 		storage = storage * share -- consider capacity only up to the share slider
 		local reservedExpense = (resName == 'energy' and nonPassiveConsTotalExpenseEnergy or nonPassiveConsTotalExpenseMetal) -- we don't want to touch this part of expense
 		if resName == 'energy' then
+			Spring.Echo(string.format("energy %.2f - max(%.2f * %.2f, %.2f * %.2f) - 1 + (%.2f - %.2f + %.2f - %.2f) * %.2f",
+				currentLevel, income, stallMarginInc, storage, stallMarginSto,
+				income, reservedExpense, received, sent, intervalpersimspeed))
 			passiveEnergyLeft = currentLevel - max(income * stallMarginInc, storage * stallMarginSto) - 1 + (income - reservedExpense + received - sent) * intervalpersimspeed --amount of res available to assign to passive builders (in next interval); leave a tiny bit left over to avoid engines own "stall mode"
 		else
 			passiveMetalLeft =  currentLevel - max(income * stallMarginInc, storage * stallMarginSto) - 1 + (income - reservedExpense + received - sent) * intervalpersimspeed --amount of res available to assign to passive builders (in next interval); leave a tiny bit left over to avoid engines own "stall mode"
@@ -570,6 +577,71 @@ local function UpdatePassiveBuilders(teamID, interval, gameFrame)
 	local passiveEnergyStart = passiveEnergyLeft
 	
 	local havePassiveResourcesLeft = (passiveEnergyLeft > 0) and (passiveMetalLeft > 0 )
+
+
+	-- TODO
+	--[[
+		Determine how many passive resources we will use over the next interval _if_ passive builders are left alone.
+			(1) figure out each builder's metal and energy needs _per frame_ if they were allowed max BP
+			(2) figure out an INDIVIDUAL weight (0 or greater) for each builder (default: 1, or use econ-support, or use inverse of BP)
+					local builderWeights[i] -- ensure no negative values
+			(3) normalize INDIVIDUAL weights (0..1)
+					local maxWeight = 0
+					for k, v in pairs(builderWeights) do
+						maxWeight = math.max(maxWeight, v)
+					end
+
+					if maxWeight > 0 then
+						for k, v in pairs(builderWeights) do
+							builderWeights[k] = math.max(0, v / maxWeight)
+						end
+					end
+			(4) figure out a GLOBAL weight that can be multiplied by INDIVIDUAL rates such that all builders would, together, precisely consume available passive resources,
+			    keeping in mind that individualWeight * globalWeight for each builder will be capped at 1.
+					globalWeight = 1
+					-- TODO: use builderWeightedWantedMetalForThisAndSubsequentBuilders, builderWeightedWantedEnergyForThisAndSubsequentBuilders
+					local metalWanted = -- sum(builderMetalWanted[i] * min(1, builderWeights[i] * globalWeight)) for all builders
+					local energyWanted = -- sum(builderEnergyWanted[i] * min(1, builderWeights[i] * globalWeight)) for all builders
+
+					if passiveMetalLeft < metalWanted * globalWeight or passiveEnergyLeft < energyWanted * globalWeight then
+						-- REDUCE global weight if we don't have enough resources
+						globalWeight = min(passiveMetalLeft / metalWanted, passiveEnergyLeft / energyWanted)
+					else
+						-- INCREASE global weight if we have leftover resources, keeping in mind that individualWeight * globalWeight for each builder will be capped at 1.
+						local sortedBuilders -- builders sorted by local weight
+						local pretendMetalLeft = passiveMetalLeft
+						local pretendEnergyLeft = passiveEnergyLeft
+						for i in 1..n do
+							if builderWeights[i] > 0 then
+								local pretendMetalWanted = builderWeightedWantedMetalForThisAndSubsequentBuilders[i] * globalWeight
+								local pretendEnergyWanted = builderWeightedWantedEnergyForThisAndSubsequentBuilders[i] * globalWeight
+								globalWeight = globalWeight * min(passiveMetalLeft / pretendMetalWanted, passiveEnergyLeft / pretendEnergyWanted, 1 / builderWeights[i])
+								pretendMetalLeft = pretendMetalLeft - builderMetalWanted[i] * builderWeights[i] * globalWeight
+								pretendEnergyLeft = pretendEnergyLeft - builderEnergyWanted[i] * builderWeights[i] * globalWeight
+							end
+						end
+					end
+			(5) set the next K builders' buildpower
+					for i in 1..k do
+						MayBeSetWantedBuildSpeed(builderID, maxBuildSpeed[builderID] * math.min(1, builderWeights[i] * globalWeight)) -- product of weights can't exceed 1
+					end
+					nextK = nextK + k
+			(6) Figure out if we're going to use too many resources over the next interval -- this handles sharp drops in resources.
+			    Sharp increases in resources don't need special-casing, as we should get all builders up to full buildpower soon enough.
+					local metalWanted = -- sum(builderMetalWanted[i] * builderCurrentBP[i] / builderMaxBP[i] for all builders
+					local energyWanted = -- sum(builderEnergyWanted[i] * builderCurrentBP[i] / builderMaxBP[i] for all builders
+			(7) if we're going to use too many resources, remove some from builders, starting with the builder with the least-recent
+			    BP update (whose BP is due to be updated soon anyway), until our resource use is expected to be within limits again:
+					while metalWanted > passiveMetalLeft or energyWanted > passiveEnergyLeft do
+						metalWanted = metalWanted - builderMetalWanted[nextK]
+						energyWanted = energyWanted - builderEnergyWanted[nextK]
+						MayBeSetWantedBuildSpeed(builderIDs[nextK], 0)
+						nextK = nextK + 1
+						if nextK > n then
+							nextK = 1
+						end
+					end
+	]]--
 	
 	if havePassiveResourcesLeft then
 		highPrioBuildPowerUsed = highPrioBuildPowerWanted
@@ -598,6 +670,7 @@ local function UpdatePassiveBuilders(teamID, interval, gameFrame)
 	local b0, b1, n = sortMetalBurdensAndGetInitialPointers(lowPrioBuilderMetalBurdens, resourcesLeftMetalBurden)
 	local bClosest = -1
 
+	Spring.Echo("")
 	-- Set build speed for all low-priority builders that are building
 	while true do
 		-- We can spend resources, and at least one builder hasn't received resources yet.
@@ -609,6 +682,7 @@ local function UpdatePassiveBuilders(teamID, interval, gameFrame)
 		local builderID = lowPrioBuilderMetalBurdens[bClosest][2]
 		local builtUnitID = lowPrioBuilderMetalBurdens[bClosest][3]
 
+		Spring.Echo("checking whether " .. tostring(builderID) .. " is building")
 		if passiveExpense[builderID] then -- this builder is actually building
 			--Spring.Echo("checking whether we have passive resources left: " .. tostring(passiveMetalLeft) .. ", " .. tostring(passiveEnergyLeft))
 			local wantedBuildSpeed = 0 -- init at zero buildspeed
@@ -643,6 +717,8 @@ local function UpdatePassiveBuilders(teamID, interval, gameFrame)
 					if VERBOSE then Spring.Echo(string.format("Had some for builder %d at index %i (burden %.2f)  %.2f/%.2f, %.2f/%.2f (%.2f/%.2f %.2f)", builderID, bClosest, lowPrioBuilderMetalBurdens[bClosest][1],
 						passivePullMetal, passiveMetalLeft, passivePullEnergy, passiveEnergyLeft, passiveExpense[builderID], passiveExpense[builderID + energyOffset], intervalpersimspeed)) end
 				end
+			else
+				Spring.Echo("no passive resources to begin with")
 			end
 			MaybeSetWantedBuildSpeed(builderID, wantedBuildSpeed)
 			lowPrioBuildPowerUsed = lowPrioBuildPowerUsed + wantedBuildSpeed
